@@ -42,11 +42,9 @@ float sdRoundRect(float2 p, float2 halfSize, float r) {
   return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
 }
 
-float2 sdNormal(float2 p, float2 halfSize, float r) {
-  float2 q = abs(p) - halfSize + r;
-  float2 n = (q.x > 0.0 && q.y > 0.0) ? normalize(q)
-                                      : (q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0));
-  return n * sign(p + float2(1e-6, 1e-6));
+// 平滑 max(q,0)：法线方向在角区连续旋转，消除对角线上的方向折痕
+float2 softClamp(float2 q, float soft) {
+  return 0.5 * (q + sqrt(q * q + soft * soft));
 }
 
 float2 toBlurUV(float2 px) {
@@ -64,23 +62,46 @@ float4 PSLens(float4 pos : SV_Position) : SV_Target {
   float coverage = saturate(0.5 - sd);
   if (coverage <= 0.0) return float4(0, 0, 0, 0);
 
-  // 单峰透镜剖面：边界处位移 0（内容跨界连续），峰值在带内 22% 处快速起坡
-  //（外圈窄带强压缩 = 水滴边缘的收束感），随后幂次缓释回 0 与平整中心衔接。
-  // 幅度上限 0.55×带宽保证采样深度不超出弯曲带：无远距鬼影、无失踪带
+  // 凸透镜边缘（外向折射）：玻璃边缘把边界外的内容压缩折进边缘带，与
+  // iOS 液态玻璃/玻璃球边缘的光学一致。剖面 (1-t)²：边界处向外看得最远
+  //（maxBend），沿深度平滑衰减到 0（C¹ 衔接平整中心）。映射斜率
+  // = 1 + 2·maxBend/bezel·(1-t) ≥ 1：处处压缩，结构上不存在拉伸/鬼影
   float depth = -sd;
   float2 disp = float2(0, 0);
+  float2 nrm = float2(0, 0);
+  float humpV = 0.0;
   if (depth > 0.0 && depth < bezel) {
+    float2 q = abs(p) - halfSize + r;
+    // 法线方向平滑过角（软化系数取圆角半径量级），位移在角区连续旋转
+    float2 qs = softClamp(q, max(r * 0.8, 1.0));
+    nrm = (qs / max(length(qs), 1e-4)) * sign(p + float2(1e-6, 1e-6));
     float t = depth / bezel;
-    float tp = 0.22;
-    float hump = t < tp ? sin(1.5707963 * t / tp)
-                        : pow(1.0 - (t - tp) / (1.0 - tp), 1.6);
-    disp = -sdNormal(p, halfSize, r) * (hump * maxBend) * dispFactor;
+    humpV = (1.0 - t) * (1.0 - t);
+    disp = nrm * (humpV * maxBend) * dispFactor;
   }
 
-  float cr = tex.Sample(smp, toBlurUV(css + disp)).r;
-  float cg = tex.Sample(smp, toBlurUV(css + disp * (1.0 - aberration * 0.05))).g;
-  float cb = tex.Sample(smp, toBlurUV(css + disp * (1.0 - aberration * 0.1))).b;
-  float3 c = float3(cr, cg, cb);
+  // 压缩带内做 5 tap 足迹积分（径向 + 切向拉丝）：边缘带是 2~3 倍缩小
+  // 映射，点采样会产生锯齿/摩尔纹；径向扩散随压缩强度自适应加宽做
+  // 抗锯齿，同时保留可辨认的压缩内容（苹果边缘的"流动光带"质感）
+  float3 c;
+  float dispLen2 = dot(disp, disp);
+  if (dispLen2 > 0.25) {
+    float2 tangent = float2(nrm.y, -nrm.x) * sqrt(dispLen2);
+    float rs = 0.05 + 0.10 * humpV;
+    float radial[5] = { 1.0 - 2.0 * rs, 1.0 - rs, 1.0, 1.0 + rs, 1.0 + 2.0 * rs };
+    const float lateral[5] = { -0.36, 0.18, 0.0, -0.18, 0.36 };
+    const float wts[5] = { 0.14, 0.22, 0.28, 0.22, 0.14 };
+    c = float3(0, 0, 0);
+    [unroll] for (int i = 0; i < 5; ++i) {
+      float2 d = disp * radial[i] + tangent * lateral[i];
+      c += wts[i] * float3(
+          tex.Sample(smp, toBlurUV(css + d)).r,
+          tex.Sample(smp, toBlurUV(css + d * (1.0 - aberration * 0.05))).g,
+          tex.Sample(smp, toBlurUV(css + d * (1.0 - aberration * 0.1))).b);
+    }
+  } else {
+    c = tex.Sample(smp, toBlurUV(css + disp)).rgb;
+  }
   float lum = dot(c, float3(0.213, 0.715, 0.072));
   c = lerp(lum.xxx, c, saturation);
 
@@ -317,10 +338,11 @@ void GlassRenderer::RunPasses(ID3D11DeviceContext* ctx, GlassPanel& panel, float
     const float margin = kBlurMarginCss * dpr;
 
     // 与 WebGL 版一致的透镜几何（物理像素）。
-    // maxBend ≤ 0.55×bezel：配合单峰剖面保证映射基本单调（无远距鬼影/失踪带）
+    // maxBend = 边界处向外看的最远距离（外向折射无单调性约束，可以做强）；
+    // 上限受模糊纹理外扩边距（kBlurMarginCss）限制，防止采样越界钳制
     const float halfMin = std::min(panelW, panelH) / 2.0f;
     const float bezel = std::min(24.0f * dpr, halfMin * 0.55f);
-    const float maxBend = std::min(28.0f * dpr, bezel * 0.55f);
+    const float maxBend = std::min({ 16.0f * dpr, bezel * 0.6f, margin * 0.8f });
 
     ShaderParams params{};
     params.glassSize[0] = panelW;
