@@ -2,12 +2,16 @@
 
 #include <algorithm>
 
+#include "stats.h"
+
 namespace {
 
-// 无可见面板持续该时长后释放 DDA 会话（不白占系统采集资源）
+// Release the DDA session after this long without any visible panel
+// (don't hold system capture resources for nothing)
 constexpr ULONGLONG kCaptureIdleReleaseMs = 3000;
-// 亮度采样由重绘驱动（桌面内容变化才推送），此值仅节流高频变化，上限约 60Hz
-// （GetTickCount64 分辨率 ~15.6ms，阈值取 15 恰好逐帧不跳帧）
+// Luma sampling is repaint-driven (pushed only when desktop content changes);
+// this merely throttles rapid changes to ~60Hz max (GetTickCount64 resolution
+// is ~15.6ms, so a threshold of 15 keeps every frame without skipping)
 constexpr ULONGLONG kLumaMinGapMs = 15;
 constexpr ULONGLONG kAnchorReassertMs = 500;
 
@@ -118,6 +122,7 @@ void GlassSession::SetLumaBands(int id, std::vector<LumaBand> bands) {
         auto it = panels_.find(id);
         if (it == panels_.end()) return;
         it->second.lumaBands = std::move(bands);
+        it->second.renderer->SetLumaWanted(!it->second.lumaBands.empty());
         it->second.lastLumaTick = 0;
     });
 }
@@ -161,7 +166,7 @@ void GlassSession::PumpCommandsAndMessages() {
     }
     for (auto& cmd : pending) cmd();
 
-    // 泵窗口消息（面板窗口从属本线程）
+    // Pump window messages (panel windows belong to this thread)
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
@@ -169,10 +174,16 @@ void GlassSession::PumpCommandsAndMessages() {
     }
 }
 
-// 把最新桌面帧留存到持久缓存：新面板在静止桌面上也能立即取到像素完成首绘
-bool GlassSession::UpdateDesktopCache(ID3D11Texture2D* frameTex) {
+// Keep the latest desktop frame in a persistent mirror so a new panel on a
+// static desktop still gets pixels for its first paint immediately.
+// Incremental maintenance: only this frame's dirty bounding box (output-local
+// coords) is copied; the mirror remains an exact replica of the desktop while
+// copy volume is proportional to the changed area instead of the full screen
+// (a small corner animation no longer triggers full-screen copies).
+bool GlassSession::UpdateDesktopCache(ID3D11Texture2D* frameTex, const RECT& dirtyLocal) {
     D3D11_TEXTURE2D_DESC desc{};
     frameTex->GetDesc(&desc);
+    bool fullCopy = false;
     if (!desktopCache_ || cacheW_ != desc.Width || cacheH_ != desc.Height) {
         desc.BindFlags = 0;
         desc.MiscFlags = 0;
@@ -182,22 +193,43 @@ bool GlassSession::UpdateDesktopCache(ID3D11Texture2D* frameTex) {
         }
         cacheW_ = desc.Width;
         cacheH_ = desc.Height;
+        fullCopy = true;  // fresh texture contents are undefined; one full copy is required
     }
-    context_->CopyResource(desktopCache_.Get(), frameTex);
+
+    uint64_t bytes = 0;
+    if (fullCopy) {
+        context_->CopyResource(desktopCache_.Get(), frameTex);
+        bytes = static_cast<uint64_t>(cacheW_) * cacheH_ * 4;
+    } else {
+        const RECT clamped{ std::max<LONG>(dirtyLocal.left, 0), std::max<LONG>(dirtyLocal.top, 0),
+                            std::min<LONG>(dirtyLocal.right, cacheW_),
+                            std::min<LONG>(dirtyLocal.bottom, cacheH_) };
+        if (clamped.right <= clamped.left || clamped.bottom <= clamped.top) return true;
+        D3D11_BOX box{ static_cast<UINT>(clamped.left), static_cast<UINT>(clamped.top), 0,
+                       static_cast<UINT>(clamped.right), static_cast<UINT>(clamped.bottom), 1 };
+        context_->CopySubresourceRegion(desktopCache_.Get(), 0, box.left, box.top, 0,
+                                        frameTex, 0, &box);
+        bytes = static_cast<uint64_t>(box.right - box.left) * (box.bottom - box.top) * 4;
+    }
+    GlassStats::Instance().cacheCopies.fetch_add(1, std::memory_order_relaxed);
+    GlassStats::Instance().cacheCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
     cacheValid_ = true;
     return true;
 }
 
 void GlassSession::RenderTick() {
     const ULONGLONG now = GetTickCount64();
+    GlassStats::Instance().loopIterations.fetch_add(1, std::memory_order_relaxed);
 
     bool anyVisible = false;
     bool anyFading = false;
     const PanelEntry* firstVisible = nullptr;
+    std::vector<RECT> selfRects;
     for (auto& [id, entry] : panels_) {
         if (entry.panel->visible()) {
             anyVisible = true;
             if (!firstVisible) firstVisible = &entry;
+            selfRects.push_back(entry.config.bounds);
         }
         if (entry.fading) anyFading = true;
     }
@@ -214,14 +246,15 @@ void GlassSession::RenderTick() {
     }
     lastActiveTick_ = now;
 
-    // 采集会话跟随首个可见面板所在显示器
+    // The capture session follows the display of the first visible panel
     if (firstVisible) {
         const RECT& b = firstVisible->config.bounds;
         if (!capturer_.initialized() || !RectIntersects(capturer_.desktopRect(), b)) {
             capturer_.Shutdown();
             cacheValid_ = false;
             if (FAILED(capturer_.Initialize(device_.Get(), b))) {
-                // 初始化失败（如安全桌面期间）：稍后重试，面板保持上一帧内容
+                // Init failed (e.g. secure desktop active): retry later while
+                // panels keep their last frame
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait_for(lock, std::chrono::milliseconds(300));
                 return;
@@ -229,15 +262,17 @@ void GlassSession::RenderTick() {
         }
     }
 
-    // 等待新帧（短超时保证命令与淡入淡出及时推进）
+    // Wait for a new frame (short timeout keeps commands and fades responsive)
     CaptureFrameInfo frameInfo;
     bool newFrame = false;
     RECT dirtyVirtual{};
     {
         ComPtr<ID3D11Texture2D> desktopTex;
-        const HRESULT hr = capturer_.AcquireFrame(8, &frameInfo, &desktopTex);
+        const HRESULT hr = capturer_.AcquireFrame(8, selfRects, &frameInfo, &desktopTex);
         if (hr == S_OK) {
-            if (frameInfo.desktopUpdated && UpdateDesktopCache(desktopTex.Get())) {
+            if (frameInfo.desktopUpdated &&
+                UpdateDesktopCache(desktopTex.Get(), frameInfo.dirtyBounds)) {
+                GlassStats::Instance().framesAcquired.fetch_add(1, std::memory_order_relaxed);
                 newFrame = true;
                 const RECT& dr = capturer_.desktopRect();
                 dirtyVirtual = RECT{ frameInfo.dirtyBounds.left + dr.left,
@@ -247,7 +282,8 @@ void GlassSession::RenderTick() {
             }
             capturer_.ReleaseFrame();
         } else if (hr != S_FALSE) {
-            // ACCESS_LOST 等：重建会话（分辨率切换、全屏独占、安全桌面切换）
+            // ACCESS_LOST etc.: rebuild the session (resolution change,
+            // fullscreen exclusive mode, secure desktop transitions)
             capturer_.Shutdown();
             return;
         }
@@ -256,6 +292,22 @@ void GlassSession::RenderTick() {
     const bool fadeTickDue = now - lastFadeTick_ >= 16;
     for (auto& [id, entry] : panels_) {
         if (!entry.panel->visible()) continue;
+
+        // Luminance band sampling (adaptive text contrast): reads the staging
+        // copy queued during the previous tick's render. Deferring one tick
+        // (≤16ms, imperceptible) buys a zero-wait Map — mapping in the same
+        // tick as the render forces a flush and synchronously waits for the
+        // whole GPU pipeline (~400µs of pure stall per sample, measured).
+        // lastLumaTick == 0 means the band config just changed: sample once
+        // from the existing texture even without a render (synchronous fallback)
+        if (!entry.lumaBands.empty() && entry.renderer->hasFrame() &&
+            (entry.lumaStagingDirty || entry.lastLumaTick == 0) &&
+            now - entry.lastLumaTick >= kLumaMinGapMs) {
+            entry.lastLumaTick = now;
+            entry.lumaStagingDirty = false;
+            SampleLuma(id, entry);
+        }
+
         const RECT region = GlassRenderer::RegionForPanel(
             entry.config.bounds, entry.config.params, entry.config.dpr);
         const bool dirtyHit = newFrame && RectIntersects(dirtyVirtual, region);
@@ -267,10 +319,12 @@ void GlassSession::RenderTick() {
                     *entry.panel, entry.config.dpr))) {
                 entry.needsInitialPaint = false;
                 rendered = true;
+                if (!entry.lumaBands.empty()) entry.lumaStagingDirty = true;
+                GlassStats::Instance().renders.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
-        // 淡入淡出推进（无新帧时用上帧区域纹理重绘）
+        // Advance fades (redraw from the last region texture when no new frame)
         if (entry.fading && fadeTickDue) {
             const bool continuing = entry.panel->FadeStep();
             if (!rendered) entry.renderer->Redraw(context_.Get(), *entry.panel, entry.config.dpr);
@@ -280,17 +334,8 @@ void GlassSession::RenderTick() {
             }
         }
 
-        // 亮度带采样（自适应反色）：由重绘驱动——本 tick 重绘过说明面板下方内容
-        // 刚变化，立即回读推送（上限 ~60Hz），反色与画面同帧；桌面静止时零推送。
-        // lastLumaTick=0 表示带配置刚更新，即使无重绘也用现存纹理补采一次
-        if (!entry.lumaBands.empty() && entry.renderer->hasFrame() &&
-            (rendered || entry.lastLumaTick == 0) &&
-            now - entry.lastLumaTick >= kLumaMinGapMs) {
-            entry.lastLumaTick = now;
-            SampleLuma(id, entry);
-        }
-
-        // 周期性重申 z 序锚定（防其他置顶窗口插队）
+        // Periodically re-assert z-order anchoring (defends against other
+        // topmost windows cutting in)
         if (entry.config.anchor && now - entry.lastAnchorTick >= kAnchorReassertMs) {
             entry.lastAnchorTick = now;
             entry.panel->AnchorBelow(entry.config.anchor);

@@ -1,4 +1,4 @@
-// electron-liquid-glass 原生入口（Windows）：N-API 绑定 + 会话生命周期
+// electron-liquid-glass native entry (Windows): N-API bindings + session lifecycle
 #include <napi.h>
 #include <windows.h>
 
@@ -9,11 +9,13 @@
 #include "d3d_utils.h"
 #include "panel.h"
 #include "session.h"
+#include "stats.h"
 
 namespace {
 
 DWORD GetWindowsBuildNumber() {
-    // GetVersionEx 受兼容性清单影响，RtlGetVersion 始终返回真实版本
+    // GetVersionEx is affected by compatibility manifests; RtlGetVersion
+    // always reports the real version
     using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return 0;
@@ -25,7 +27,8 @@ DWORD GetWindowsBuildNumber() {
     return info.dwBuildNumber;
 }
 
-// WDA_EXCLUDEFROMCAPTURE（防自采集反馈回路）要求 Win10 2004 (build 19041)+
+// WDA_EXCLUDEFROMCAPTURE (prevents self-capture feedback loops) requires
+// Win10 2004 (build 19041)+
 Napi::Value IsSupported(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(info.Env(), GetWindowsBuildNumber() >= 19041);
 }
@@ -34,7 +37,7 @@ Napi::Value OsBuild(const Napi::CallbackInfo& info) {
     return Napi::Number::New(info.Env(), static_cast<double>(GetWindowsBuildNumber()));
 }
 
-// —— 参数解析辅助 ——
+// —— Argument parsing helpers ——
 
 LONG GetInt(Napi::Object obj, const char* key, LONG fallback = 0) {
     Napi::Value v = obj.Get(key);
@@ -94,7 +97,7 @@ std::vector<LumaBand> BandsFromValue(Napi::Value value) {
     return bands;
 }
 
-// —— 面板 API ——
+// —— Panel API ——
 
 Napi::Value CreatePanel(const Napi::CallbackInfo& info) {
     auto opts = info[0].As<Napi::Object>();
@@ -135,7 +138,8 @@ Napi::Value SetPanelBounds(const Napi::CallbackInfo& info) {
 
 Napi::Value SetPanelParams(const Napi::CallbackInfo& info) {
     const int id = info[0].As<Napi::Number>().Int32Value();
-    // JS 侧维护完整参数对象（缺省字段保留默认值语义由 JS 保证）
+    // The JS side maintains the full params object (JS guarantees omitted
+    // fields keep their default-value semantics)
     GlassSession::Instance().SetPanelParams(
         id, ParamsFromObject(info[1].As<Napi::Object>(), GlassParams{}));
     return info.Env().Undefined();
@@ -153,7 +157,7 @@ Napi::Value SetLumaBands(const Napi::CallbackInfo& info) {
     return info.Env().Undefined();
 }
 
-// —— 亮度回调（工作线程 → JS 主线程，TSFN 转发）——
+// —— Luma callback (worker thread → JS main thread via TSFN) ——
 
 using LumaPayload = std::pair<int, std::vector<LumaBandStats>>;
 Napi::ThreadSafeFunction g_lumaTsfn;
@@ -167,12 +171,14 @@ Napi::Value SetLumaCallback(const Napi::CallbackInfo& info) {
     if (info.Length() > 0 && info[0].IsFunction()) {
         g_lumaTsfn = Napi::ThreadSafeFunction::New(
             info.Env(), info[0].As<Napi::Function>(), "liquid-glass-luma", 4, 1);
-        g_lumaTsfn.Unref(info.Env());  // 不阻止进程退出
+        g_lumaTsfn.Unref(info.Env());  // don't keep the process alive
         GlassSession::Instance().SetLumaCallback([](int panelId, std::vector<LumaBandStats> bands) {
             if (!g_lumaTsfn) return;
             auto* payload = new LumaPayload(panelId, std::move(bands));
-            // 采样最高 ~60Hz：JS 忙时队列（容量 4）可能拒收，必须回收 payload；
-            // 丢弃的是中间态样本，最新样本随下一次重绘再来
+            // Sampling runs at ~60Hz max: when JS is busy the queue
+            // (capacity 4) may reject, and the payload must be reclaimed.
+            // Only intermediate samples are dropped — the freshest one
+            // arrives with the next repaint.
             const napi_status status = g_lumaTsfn.NonBlockingCall(
                 payload, [](Napi::Env env, Napi::Function cb, LumaPayload* data) {
                     Napi::Object bands = Napi::Object::New(env);
@@ -204,7 +210,27 @@ Napi::Value ShutdownSession(const Napi::CallbackInfo& info) {
     return info.Env().Undefined();
 }
 
-// —— 诊断探针（测试/排障用，见 tmp/native-step*.cjs）——
+// Snapshot of internal performance counters (diagnostics/benchmarks);
+// reset=true clears them after reading
+Napi::Value Stats(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    GlassStats& s = GlassStats::Instance();
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("loopIterations", Napi::Number::New(env, static_cast<double>(s.loopIterations.load())));
+    result.Set("framesAcquired", Napi::Number::New(env, static_cast<double>(s.framesAcquired.load())));
+    result.Set("cacheCopies", Napi::Number::New(env, static_cast<double>(s.cacheCopies.load())));
+    result.Set("cacheCopyBytes", Napi::Number::New(env, static_cast<double>(s.cacheCopyBytes.load())));
+    result.Set("renders", Napi::Number::New(env, static_cast<double>(s.renders.load())));
+    result.Set("lumaSamples", Napi::Number::New(env, static_cast<double>(s.lumaSamples.load())));
+    result.Set("lumaMapWaitUs", Napi::Number::New(env, static_cast<double>(s.lumaMapWaitUs.load())));
+    result.Set("lumaCpuUs", Napi::Number::New(env, static_cast<double>(s.lumaCpuUs.load())));
+    if (info.Length() > 0 && info[0].IsBoolean() && info[0].As<Napi::Boolean>().Value()) {
+        s.Reset();
+    }
+    return result;
+}
+
+// —— Diagnostic probes (testing/troubleshooting, see tmp/native-step*.cjs) ——
 
 Napi::Value ProbeCapture(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -245,7 +271,7 @@ Napi::Value ProbeCapture(const Napi::CallbackInfo& info) {
         if ((now.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart >= durationMs) break;
         CaptureFrameInfo frameInfo;
         ComPtr<ID3D11Texture2D> texture;
-        hr = capturer.AcquireFrame(30, &frameInfo, &texture);
+        hr = capturer.AcquireFrame(30, {}, &frameInfo, &texture);
         if (hr == S_FALSE) {
             timeouts++;
             continue;
@@ -322,9 +348,10 @@ Napi::Value ProbePanel(const Napi::CallbackInfo& info) {
     return result;
 }
 
-// 单次渲染探针：采集一帧 → 玻璃管线渲染一次 → 保持显示。
-// 不进入持续采集循环，因此 exclude=false 也不会产生自采集反馈，
-// 用于对着色器输出做视觉回归（生产路径始终 exclude=true）。
+// Single-render probe: capture one frame → run the glass pipeline once →
+// keep it displayed. It never enters the continuous capture loop, so even
+// exclude=false cannot create self-capture feedback. Used for visual
+// regression of the shader output (the production path always excludes).
 Napi::Value ProbeGlassShot(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     Napi::Object opts = info[0].As<Napi::Object>();
@@ -346,12 +373,12 @@ Napi::Value ProbeGlassShot(const Napi::CallbackInfo& info) {
         return result;
     }
 
-    // 等一帧真实桌面内容
+    // Wait for one frame of real desktop content
     CaptureFrameInfo frameInfo;
     ComPtr<ID3D11Texture2D> desktopTex;
     const ULONGLONG deadline = GetTickCount64() + 1500;
     for (;;) {
-        hr = capturer.AcquireFrame(50, &frameInfo, desktopTex.ReleaseAndGetAddressOf());
+        hr = capturer.AcquireFrame(50, {}, &frameInfo, desktopTex.ReleaseAndGetAddressOf());
         if (hr == S_OK && frameInfo.desktopUpdated) break;
         if (hr == S_OK) capturer.ReleaseFrame();
         if (FAILED(hr) || GetTickCount64() > deadline) {
@@ -414,11 +441,13 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("setLumaBands", Napi::Function::New(env, SetLumaBands));
     exports.Set("setLumaCallback", Napi::Function::New(env, SetLumaCallback));
     exports.Set("shutdown", Napi::Function::New(env, ShutdownSession));
+    exports.Set("_stats", Napi::Function::New(env, Stats));
     exports.Set("_probeCapture", Napi::Function::New(env, ProbeCapture));
     exports.Set("_probePanel", Napi::Function::New(env, ProbePanel));
     exports.Set("_probeGlassShot", Napi::Function::New(env, ProbeGlassShot));
 
-    // 进程退出前回收工作线程，避免持有窗口/设备时被强杀
+    // Join the worker thread before process exit so it isn't killed while
+    // holding windows/devices
     env.AddCleanupHook([] { GlassSession::Instance().Shutdown(); });
     return exports;
 }

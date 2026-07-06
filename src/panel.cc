@@ -7,7 +7,7 @@ namespace {
 constexpr wchar_t kClassName[] = L"ElectronLiquidGlassPanel";
 
 LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    // 命中测试直接穿透：面板永远不参与鼠标交互
+    // Hit-test straight through: the panel never takes mouse interaction
     if (msg == WM_NCHITTEST) return HTTRANSPARENT;
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -46,7 +46,8 @@ HRESULT GlassPanel::Create(ID3D11Device* device, const RECT& bounds, const Glass
     bounds_ = bounds;
     params_ = params;
 
-    // WS_EX_NOREDIRECTIONBITMAP：内容完全来自 DComp 合成链，无 GDI 表面
+    // WS_EX_NOREDIRECTIONBITMAP: content comes entirely from the DComp
+    // composition chain; no GDI surface exists
     hwnd_ = CreateWindowExW(
         WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         kClassName, L"", WS_POPUP,
@@ -76,8 +77,9 @@ HRESULT GlassPanel::Create(ID3D11Device* device, const RECT& bounds, const Glass
     hr = dcompDevice_->Commit();
     if (FAILED(hr)) return hr;
 
-    // 把两个 flip 缓冲都清成全透明再显示：
-    // 否则首个内容帧到来前 DComp 会合成未初始化的显存垃圾（洋红/青色块）
+    // Clear both flip buffers to fully transparent before showing: otherwise
+    // DComp composites uninitialized VRAM garbage (magenta/cyan blocks) until
+    // the first content frame arrives
     ComPtr<ID3D11DeviceContext> ctx;
     device_->GetImmediateContext(&ctx);
     const float transparent[4] = { 0, 0, 0, 0 };
@@ -154,7 +156,7 @@ void GlassPanel::Hide() {
 void GlassPanel::AnchorBelow(HWND anchor) {
     if (!hwnd_) return;
     if (anchor && IsWindow(anchor)) {
-        // insertAfter=anchor：面板紧贴锚点窗口的下一层
+        // insertAfter=anchor: the panel sits immediately below the anchor window
         SetWindowPos(hwnd_, anchor, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     } else {
         SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -190,8 +192,9 @@ ID3D11RenderTargetView* GlassPanel::AcquireBackBuffer() {
 
 void GlassPanel::Present() {
     if (!swapchain_) return;
-    // Present(0)：立即入队不等 vblank，DWM 合成时取最新
+    // Present(0): queue immediately without waiting for vblank; DWM picks up
+    // the latest at composition time
     swapchain_->Present(0, 0);
-    // FLIP 模型 Present 后 RTV 失效，下一帧重新获取
+    // With the FLIP model the RTV is invalid after Present; re-acquire next frame
     rtv_.Reset();
 }

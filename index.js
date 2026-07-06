@@ -1,9 +1,13 @@
-// electron-liquid-glass JS 入口：原生模块加载守护 + 面板对象封装。
-// 原生不可用（非 Windows、系统过旧、构建缺失）时 isSupported() 返回 false，
-// 调用方据此回退自己的方案（如 Chromium 屏幕采集管线）。
+// electron-liquid-glass JS entry: guarded native module loading + panel handle wrapper.
+// node-gyp-build tries prebuilds/<platform>-<arch> first (prebuilt binaries shipped
+// on npm, N-API 8, no local compilation for consumers), then build/Release
+// (in-repo development builds).
+// When the native side is unavailable (non-Windows, OS too old, no prebuild),
+// isSupported() returns false and callers should fall back to their own approach
+// (e.g. a Chromium screen-capture pipeline).
 let native = null
 try {
-    native = require('./build/Release/liquid_glass.node')
+    native = require('node-gyp-build')(__dirname)
 } catch {
     native = null
 }
@@ -25,8 +29,9 @@ function isSupported() {
 }
 
 /**
- * 创建玻璃面板（所有长度均为物理像素；dpr 用于内部几何常量缩放）。
- * 返回面板句柄对象；原生不可用时返回 null。
+ * Create a glass panel (all lengths are physical pixels; dpr scales internal
+ * geometry constants). Returns a panel handle object, or null when the native
+ * backend is unavailable.
  */
 function createPanel(options) {
     if (!isSupported()) return null
@@ -55,7 +60,7 @@ function createPanel(options) {
     return panel
 }
 
-// 接受 Electron BrowserWindow 或 getNativeWindowHandle() 的 Buffer
+// Accepts an Electron BrowserWindow or a Buffer from getNativeWindowHandle()
 function resolveHwnd(windowOrHwnd) {
     if (!windowOrHwnd) return null
     if (Buffer.isBuffer(windowOrHwnd)) return windowOrHwnd
@@ -66,7 +71,7 @@ function resolveHwnd(windowOrHwnd) {
 }
 
 function shutdown() {
-    // 非 Windows 的桩实现只导出 isSupported/osBuild，其余入口必须判空
+    // The non-Windows stub only exports isSupported/osBuild; guard everything else
     if (native && typeof native.shutdown === 'function') native.shutdown()
     panels.clear()
     lumaHooked = false

@@ -1,7 +1,9 @@
-// 玻璃渲染器
-// 趟1/2：面板区域(+边距)半分辨率可分离高斯模糊
-// 趟3：解析式圆角矩形 SDF 透镜位移 + RGB 色散 + 饱和度 + 圆角 AA 覆盖 alpha
-// 输入为 DDA 桌面纹理的区域拷贝（区域拷贝持久保留，供淡入淡出无新帧时重绘）
+// Glass renderer
+// Pass 1/2: half-resolution separable Gaussian blur of the panel region (+ margin)
+// Pass 3: analytic rounded-rect SDF lens displacement + RGB dispersion +
+//         saturation + rounded-corner AA coverage
+// Input is a region copy of the DDA desktop texture (kept around so fades can
+// redraw without a fresh frame)
 #pragma once
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -20,22 +22,32 @@ class GlassRenderer {
 public:
     HRESULT Initialize(ID3D11Device* device);
 
-    // 从桌面帧纹理拷出面板区域后执行三趟绘制并 Present
+    // Copy the panel region out of the desktop frame texture, run the three
+    // passes and Present
     HRESULT RenderFromDesktop(ID3D11DeviceContext* ctx, ID3D11Texture2D* desktopTex,
                               const RECT& desktopRect, GlassPanel& panel, float dpr);
-    // 用最近一次的区域纹理重绘（无新帧时推进淡入淡出）
+    // Redraw from the most recent region texture (advances fades when no new
+    // frame is available)
     HRESULT Redraw(ID3D11DeviceContext* ctx, GlassPanel& panel, float dpr);
 
-    // 从模糊纹理回读各亮度带统计（均值色 + luma p15/p85）；带矩形为面板本地物理像素
+    // Read back per-band statistics from the blur texture (mean color + luma
+    // p15/p85); band rects are panel-local physical pixels
     HRESULT SampleBands(ID3D11DeviceContext* ctx, const std::vector<LumaBand>& bands,
                         float dpr, std::vector<LumaBandStats>* out);
 
+    // Declare that luma sampling will follow: the render path then queues the
+    // staging copy right after the blur passes, so the lens pass / Present
+    // submission hides the copy latency and SampleBands' Map barely waits
+    void SetLumaWanted(bool wanted) { lumaWanted_ = wanted; }
+
     bool hasFrame() const { return hasFrame_; }
-    // 面板采样区域（含模糊边距、含采样源偏移）在虚拟桌面中的矩形
+    // The panel's sampling region (including blur margin and source offset)
+    // as a rect in the virtual desktop
     static RECT RegionForPanel(const RECT& panelBounds, const GlassParams& params, float dpr);
 
 private:
     HRESULT EnsureTargets(ID3D11Device* device, UINT regionW, UINT regionH, UINT panelW, UINT panelH);
+    HRESULT EnsureStaging(ID3D11DeviceContext* ctx);
     void RunPasses(ID3D11DeviceContext* ctx, GlassPanel& panel, float dpr);
 
     ComPtr<ID3D11VertexShader> vs_;
@@ -44,17 +56,17 @@ private:
     ComPtr<ID3D11SamplerState> sampler_;
     ComPtr<ID3D11Buffer> cb_;
 
-    // 区域纹理（桌面裁剪快照，全分辨率）
+    // Region texture (desktop crop snapshot, full resolution)
     ComPtr<ID3D11Texture2D> regionTex_;
     ComPtr<ID3D11ShaderResourceView> regionSrv_;
-    // 半分辨率模糊乒乓目标
+    // Half-resolution blur ping-pong targets
     ComPtr<ID3D11Texture2D> blurTexA_;
     ComPtr<ID3D11RenderTargetView> blurRtvA_;
     ComPtr<ID3D11ShaderResourceView> blurSrvA_;
     ComPtr<ID3D11Texture2D> blurTexB_;
     ComPtr<ID3D11RenderTargetView> blurRtvB_;
     ComPtr<ID3D11ShaderResourceView> blurSrvB_;
-    // 亮度带回读用 staging（懒创建，尺寸同模糊目标）
+    // Staging texture for luma readback (lazily created, same size as blur targets)
     ComPtr<ID3D11Texture2D> stagingTex_;
 
     UINT regionW_ = 0;
@@ -62,4 +74,6 @@ private:
     UINT blurW_ = 0;
     UINT blurH_ = 0;
     bool hasFrame_ = false;
+    bool lumaWanted_ = false;   // luma bands configured: render path pre-queues the staging copy
+    bool stagingValid_ = false; // staging holds the latest blur result
 };

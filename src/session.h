@@ -1,8 +1,12 @@
-// 玻璃会话：独占工作线程运行「采集 → 渲染 → 上屏」闭环。
-// - 面板窗口在工作线程创建（窗口消息队列从属该线程）
-// - 无可见面板时不采集（休眠等命令）；桌面静止时 AcquireNextFrame 超时空转，零渲染
-// - 脏区与面板区域不相交时跳过该面板的重绘
-// - JS 侧所有调用经命令队列异步投递，无像素数据跨线程
+// Glass session: a dedicated worker thread running the capture → render →
+// present loop.
+// - Panel windows are created on the worker thread (their message queues
+//   belong to it)
+// - No capture while no panel is visible (sleeps waiting for commands); on a
+//   static desktop AcquireNextFrame just times out — zero rendering
+// - A panel's repaint is skipped when the dirty region doesn't intersect it
+// - Every JS-facing call is posted through the command queue; no pixel data
+//   ever crosses threads
 #pragma once
 #include <windows.h>
 
@@ -22,26 +26,27 @@
 #include "renderer.h"
 
 struct PanelConfig {
-    RECT bounds{};            // 屏幕物理像素
-    GlassParams params{};     // 物理像素单位
+    RECT bounds{};            // screen physical pixels
+    GlassParams params{};     // physical-pixel units
     float dpr = 1.0f;
     bool excludeFromCapture = true;
-    HWND anchor = nullptr;    // 面板贴于该窗口下方（z 序）
+    HWND anchor = nullptr;    // panel is pinned right below this window (z-order)
 };
 
-// 亮度带：面板本地物理像素矩形
+// Luminance band: rect in panel-local physical pixels
 struct LumaBand {
     int id = 0;
     RECT rect{};
 };
 
-// 亮度带统计：均值色 + 明暗分位数（自适应反色算法的完整输入）
+// Band statistics: mean color + luma percentiles (the complete input for an
+// adaptive text-contrast algorithm)
 struct LumaBandStats {
     int id = 0;
     float r = 0;
     float g = 0;
     float b = 0;
-    float darkTail = 0;   // luma p15（0~255）
+    float darkTail = 0;   // luma p15 (0-255)
     float lightTail = 0;  // luma p85
 };
 
@@ -59,7 +64,7 @@ public:
     void SetPanelParams(int id, const GlassParams& params);
     void AnchorPanel(int id, HWND anchor);
     void SetLumaBands(int id, std::vector<LumaBand> bands);
-    void SetLumaCallback(LumaCallback cb);  // 工作线程上调用（调用方负责线程安全投递）
+    void SetLumaCallback(LumaCallback cb);  // invoked on the worker thread (caller handles thread-safe dispatch)
 
     void Shutdown();
 
@@ -73,6 +78,7 @@ private:
         std::vector<LumaBand> lumaBands;
         bool needsInitialPaint = true;
         bool fading = false;
+        bool lumaStagingDirty = false;  // staging holds an unsampled blur result (set after each render)
         ULONGLONG lastLumaTick = 0;
         ULONGLONG lastAnchorTick = 0;
     };
@@ -82,7 +88,7 @@ private:
     void ThreadMain();
     void PumpCommandsAndMessages();
     void RenderTick();
-    bool UpdateDesktopCache(ID3D11Texture2D* frameTex);
+    bool UpdateDesktopCache(ID3D11Texture2D* frameTex, const RECT& dirtyLocal);
     void SampleLuma(int panelId, PanelEntry& entry);
 
     std::thread thread_;
@@ -91,11 +97,11 @@ private:
     std::condition_variable cv_;
     std::deque<std::function<void()>> commands_;
 
-    // 以下成员仅工作线程访问
+    // Members below are worker-thread only
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     DesktopCapturer capturer_;
-    ComPtr<ID3D11Texture2D> desktopCache_;  // 最新桌面帧留存（新面板静止桌面首绘）
+    ComPtr<ID3D11Texture2D> desktopCache_;  // persistent desktop mirror (instant first paint for new panels on a static desktop)
     UINT cacheW_ = 0;
     UINT cacheH_ = 0;
     bool cacheValid_ = false;

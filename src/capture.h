@@ -1,5 +1,6 @@
-// DXGI Desktop Duplication 采集器：零拷贝获取桌面 GPU 纹理。
-// 帧只在画面变化时到达（静止桌面零开销），脏区元数据用于跳过无关更新。
+// DXGI Desktop Duplication capturer: zero-copy access to the desktop GPU
+// texture. Frames arrive only when the screen changes (a static desktop costs
+// nothing); dirty-region metadata lets callers skip irrelevant updates.
 #pragma once
 #include <d3d11.h>
 #include <dxgi1_5.h>
@@ -10,24 +11,31 @@
 using Microsoft::WRL::ComPtr;
 
 struct CaptureFrameInfo {
-    bool desktopUpdated = false;  // 桌面像素有更新（区别于仅指针移动）
-    RECT dirtyBounds{};           // 脏区+移动区包围盒（输出本地坐标），desktopUpdated 时有效
+    bool desktopUpdated = false;  // desktop pixels changed (as opposed to pointer-only updates)
+    RECT dirtyBounds{};           // bounding box of dirty + move regions (output-local coords), valid when desktopUpdated
     uint32_t accumulatedFrames = 0;
 };
 
 class DesktopCapturer {
 public:
-    // 在给定设备上为包含 rect 中心的显示器建立复制会话
+    // Create a duplication session on the given device for the monitor
+    // containing the center of `monitorRect`
     HRESULT Initialize(ID3D11Device* device, const RECT& monitorRect);
     void Shutdown();
 
-    // 等待下一帧；S_OK=有帧（用毕必须 ReleaseFrame），S_FALSE=超时无帧，
-    // DXGI_ERROR_ACCESS_LOST 等错误须重建会话
-    HRESULT AcquireFrame(UINT timeoutMs, CaptureFrameInfo* info, ID3D11Texture2D** texture);
+    // Wait for the next frame; S_OK = frame available (must ReleaseFrame when
+    // done), S_FALSE = timeout, DXGI_ERROR_ACCESS_LOST etc. = rebuild session.
+    // selfRects (virtual-desktop coords): the caller's own panel window rects.
+    // After a WDA_EXCLUDEFROMCAPTURE-excluded panel Presents, DWM still
+    // reports the panel rect as dirty even though the captured content did not
+    // change. Dirty rects nearly equal to a self rect are dropped — otherwise
+    // "repaint → dirty → repaint" becomes a self-sustained loop.
+    HRESULT AcquireFrame(UINT timeoutMs, const std::vector<RECT>& selfRects,
+                         CaptureFrameInfo* info, ID3D11Texture2D** texture);
     void ReleaseFrame();
 
     bool initialized() const { return dupl_ != nullptr; }
-    // 该输出在虚拟桌面中的矩形（物理像素）
+    // This output's rect within the virtual desktop (physical pixels)
     const RECT& desktopRect() const { return desktopRect_; }
 
 private:

@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "session.h"
+#include "stats.h"
 
 namespace {
 
@@ -22,13 +23,13 @@ cbuffer P : register(b0) {
 Texture2D tex : register(t0);
 SamplerState smp : register(s0);
 
-// 全屏三角形
+// Fullscreen triangle
 float4 VSMain(uint id : SV_VertexID) : SV_Position {
   float2 pos = float2((id << 1) & 2, id & 2);
   return float4(pos * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 
-// 下采样 + 单方向高斯
+// Downsample + single-direction Gaussian
 float4 PSBlur(float4 pos : SV_Position) : SV_Target {
   float2 t = pos.xy / outSize;
   float2 uv = srcOrigin + t * srcSpan;
@@ -42,7 +43,8 @@ float sdRoundRect(float2 p, float2 halfSize, float r) {
   return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
 }
 
-// 平滑 max(q,0)：法线方向在角区连续旋转，消除对角线上的方向折痕
+// Smooth max(q,0): the normal direction rotates continuously through corner
+// regions, removing the directional crease along the diagonal
 float2 softClamp(float2 q, float soft) {
   return 0.5 * (q + sqrt(q * q + soft * soft));
 }
@@ -51,7 +53,8 @@ float2 toBlurUV(float2 px) {
   return (px + margin) / (glassSize + margin * 2.0);
 }
 
-// 透镜主着色：SDF 位移 + RGB 色散 + 饱和度，输出预乘 alpha（圆角 AA 覆盖 × 面板不透明度）
+// Main lens shading: SDF displacement + RGB dispersion + saturation, output
+// premultiplied alpha (rounded-corner AA coverage × panel opacity)
 float4 PSLens(float4 pos : SV_Position) : SV_Target {
   float2 css = pos.xy;
   float2 halfSize = glassSize * 0.5;
@@ -62,17 +65,21 @@ float4 PSLens(float4 pos : SV_Position) : SV_Target {
   float coverage = saturate(0.5 - sd);
   if (coverage <= 0.0) return float4(0, 0, 0, 0);
 
-  // 凸透镜边缘（外向折射）：玻璃边缘把边界外的内容压缩折进边缘带，与
-  // iOS 液态玻璃/玻璃球边缘的光学一致。剖面 (1-t)²：边界处向外看得最远
-  //（maxBend），沿深度平滑衰减到 0（C¹ 衔接平整中心）。映射斜率
-  // = 1 + 2·maxBend/bezel·(1-t) ≥ 1：处处压缩，结构上不存在拉伸/鬼影
+  // Convex lens rim (outward refraction): the glass edge compresses content
+  // from beyond the boundary into the rim band — optically consistent with
+  // iOS liquid glass / the rim of a glass sphere. Profile (1-t)²: looks
+  // furthest outward at the boundary (maxBend) and decays smoothly to 0 with
+  // depth (C¹ blend into the flat center). Mapping slope
+  // = 1 + 2·maxBend/bezel·(1-t) ≥ 1: compression everywhere, so stretching /
+  // ghosting is structurally impossible
   float depth = -sd;
   float2 disp = float2(0, 0);
   float2 nrm = float2(0, 0);
   float humpV = 0.0;
   if (depth > 0.0 && depth < bezel) {
     float2 q = abs(p) - halfSize + r;
-    // 法线方向平滑过角（软化系数取圆角半径量级），位移在角区连续旋转
+    // Normal direction blends smoothly through corners (softness on the order
+    // of the corner radius); displacement rotates continuously in corner areas
     float2 qs = softClamp(q, max(r * 0.8, 1.0));
     nrm = (qs / max(length(qs), 1e-4)) * sign(p + float2(1e-6, 1e-6));
     float t = depth / bezel;
@@ -80,9 +87,11 @@ float4 PSLens(float4 pos : SV_Position) : SV_Target {
     disp = nrm * (humpV * maxBend) * dispFactor;
   }
 
-  // 压缩带内做 5 tap 足迹积分（径向 + 切向拉丝）：边缘带是 2~3 倍缩小
-  // 映射，点采样会产生锯齿/摩尔纹；径向扩散随压缩强度自适应加宽做
-  // 抗锯齿，同时保留可辨认的压缩内容（苹果边缘的"流动光带"质感）
+  // 5-tap footprint integration inside the compression band (radial spread +
+  // tangential streaking): the rim maps content at 2-3× minification, so point
+  // sampling would alias/moiré. The radial spread widens adaptively with
+  // compression strength for anti-aliasing while keeping the compressed
+  // content recognizable (the "flowing light band" feel of Apple's rims).
   float3 c;
   float dispLen2 = dot(disp, disp);
   if (dispLen2 > 0.25) {
@@ -189,6 +198,7 @@ HRESULT GlassRenderer::EnsureTargets(ID3D11Device* device, UINT regionW, UINT re
     blurW_ = (regionW + 1) / 2;
     blurH_ = (regionH + 1) / 2;
     stagingTex_.Reset();
+    stagingValid_ = false;
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = regionW;
@@ -232,7 +242,8 @@ HRESULT GlassRenderer::RenderFromDesktop(ID3D11DeviceContext* ctx, ID3D11Texture
     HRESULT hr = EnsureTargets(device.Get(), regionW, regionH, pb.right - pb.left, pb.bottom - pb.top);
     if (FAILED(hr)) return hr;
 
-    // 区域拷贝：桌面纹理坐标 = 虚拟桌面坐标 - 输出原点；越界部分裁剪（目标偏移保持对齐）
+    // Region copy: desktop texture coords = virtual desktop coords - output
+    // origin; out-of-bounds parts are clipped (destination offset stays aligned)
     RECT clamped{
         std::max(region.left, desktopRect.left), std::max(region.top, desktopRect.top),
         std::min(region.right, desktopRect.right), std::min(region.bottom, desktopRect.bottom)
@@ -259,32 +270,45 @@ HRESULT GlassRenderer::Redraw(ID3D11DeviceContext* ctx, GlassPanel& panel, float
     return S_OK;
 }
 
+HRESULT GlassRenderer::EnsureStaging(ID3D11DeviceContext* ctx) {
+    if (stagingTex_) return S_OK;
+    ComPtr<ID3D11Device> device;
+    ctx->GetDevice(&device);
+    D3D11_TEXTURE2D_DESC td{};
+    blurTexB_->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    return device->CreateTexture2D(&td, nullptr, stagingTex_.ReleaseAndGetAddressOf());
+}
+
 HRESULT GlassRenderer::SampleBands(ID3D11DeviceContext* ctx, const std::vector<LumaBand>& bands,
                                    float dpr, std::vector<LumaBandStats>* out) {
     if (!hasFrame_ || !blurTexB_) return S_FALSE;
-    ComPtr<ID3D11Device> device;
-    ctx->GetDevice(&device);
 
-    if (!stagingTex_) {
-        D3D11_TEXTURE2D_DESC td{};
-        blurTexB_->GetDesc(&td);
-        td.Usage = D3D11_USAGE_STAGING;
-        td.BindFlags = 0;
-        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        HRESULT hr = device->CreateTexture2D(&td, nullptr, stagingTex_.ReleaseAndGetAddressOf());
+    // Normal path: RunPasses already queued the copy after the blur passes;
+    // this is only a fallback (band config arrived after the latest render,
+    // so staging has no content yet)
+    if (!stagingValid_) {
+        HRESULT hr = EnsureStaging(ctx);
         if (FAILED(hr)) return hr;
+        ctx->CopyResource(stagingTex_.Get(), blurTexB_.Get());
+        stagingValid_ = true;
     }
-    ctx->CopyResource(stagingTex_.Get(), blurTexB_.Get());
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
+    const uint64_t mapStartUs = QpcNowUs();
     HRESULT hr = ctx->Map(stagingTex_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) return hr;
+    const uint64_t cpuStartUs = QpcNowUs();
+    GlassStats::Instance().lumaMapWaitUs.fetch_add(cpuStartUs - mapStartUs, std::memory_order_relaxed);
     const auto* pixels = static_cast<const uint8_t*>(mapped.pData);
 
     const float margin = kBlurMarginCss * dpr;
     uint32_t histogram[256];
     for (const LumaBand& band : bands) {
-        // 面板本地物理像素 → 模糊纹理坐标（区域含边距，半分辨率）
+        // Panel-local physical pixels → blur texture coords (region includes
+        // the margin, half resolution)
         const LONG x0 = std::clamp<LONG>(static_cast<LONG>((band.rect.left + margin) / 2), 0, blurW_ - 1);
         const LONG x1 = std::clamp<LONG>(static_cast<LONG>((band.rect.right + margin) / 2), 1, blurW_);
         const LONG y0 = std::clamp<LONG>(static_cast<LONG>((band.rect.top + margin) / 2), 0, blurH_ - 1);
@@ -295,19 +319,24 @@ HRESULT GlassRenderer::SampleBands(ID3D11DeviceContext* ctx, const std::vector<L
         double sumB = 0;
         double sumG = 0;
         double sumR = 0;
-        for (LONG y = y0; y < y1; y++) {
+        // Stride-2 subsampling for large bands: the blurred texture is
+        // low-frequency, so statistics match full sampling at 1/4 the CPU cost
+        const LONG step = (x1 - x0) * (y1 - y0) > 4096 ? 2 : 1;
+        uint32_t count = 0;
+        for (LONG y = y0; y < y1; y += step) {
             const uint8_t* row = pixels + y * mapped.RowPitch;
-            for (LONG x = x0; x < x1; x++) {
+            for (LONG x = x0; x < x1; x += step) {
                 const uint8_t* px = row + x * 4;  // BGRA
                 sumB += px[0];
                 sumG += px[1];
                 sumR += px[2];
                 const int luma = static_cast<int>((px[2] * 54 + px[1] * 183 + px[0] * 19) >> 8);
                 histogram[luma > 255 ? 255 : luma]++;
+                count++;
             }
         }
-        const uint32_t count = static_cast<uint32_t>((x1 - x0) * (y1 - y0));
-        // 直方图求 luma p15 / p85
+        if (count == 0) continue;
+        // Luma p15 / p85 from the histogram
         const auto percentile = [&](float q) -> float {
             const uint32_t target = static_cast<uint32_t>(count * q);
             uint32_t acc = 0;
@@ -327,6 +356,8 @@ HRESULT GlassRenderer::SampleBands(ID3D11DeviceContext* ctx, const std::vector<L
         out->push_back(stats);
     }
     ctx->Unmap(stagingTex_.Get(), 0);
+    GlassStats::Instance().lumaSamples.fetch_add(1, std::memory_order_relaxed);
+    GlassStats::Instance().lumaCpuUs.fetch_add(QpcNowUs() - cpuStartUs, std::memory_order_relaxed);
     return S_OK;
 }
 
@@ -337,9 +368,11 @@ void GlassRenderer::RunPasses(ID3D11DeviceContext* ctx, GlassPanel& panel, float
     const float panelH = static_cast<float>(pb.bottom - pb.top);
     const float margin = kBlurMarginCss * dpr;
 
-    // 与 WebGL 版一致的透镜几何（物理像素）。
-    // maxBend = 边界处向外看的最远距离（外向折射无单调性约束，可以做强）；
-    // 上限受模糊纹理外扩边距（kBlurMarginCss）限制，防止采样越界钳制
+    // Lens geometry matching the WebGL implementation (physical pixels).
+    // maxBend = how far past the boundary the rim looks outward (outward
+    // refraction has no monotonicity constraint, so it can be strong); capped
+    // by the blur texture margin (kBlurMarginCss) to avoid clamped sampling
+    // beyond the region.
     const float halfMin = std::min(panelW, panelH) / 2.0f;
     const float bezel = std::min(24.0f * dpr, halfMin * 0.55f);
     const float maxBend = std::min({ 16.0f * dpr, bezel * 0.6f, margin * 0.8f });
@@ -368,7 +401,7 @@ void GlassRenderer::RunPasses(ID3D11DeviceContext* ctx, GlassPanel& panel, float
     };
     ID3D11ShaderResourceView* nullSrv = nullptr;
 
-    // 趟1：区域全分辨率 → 半分辨率 + 水平高斯
+    // Pass 1: full-res region → half res + horizontal Gaussian
     params.srcOrigin[0] = 0;
     params.srcOrigin[1] = 0;
     params.srcSpan[0] = 1;
@@ -385,7 +418,7 @@ void GlassRenderer::RunPasses(ID3D11DeviceContext* ctx, GlassPanel& panel, float
     ctx->Draw(3, 0);
     ctx->PSSetShaderResources(0, 1, &nullSrv);
 
-    // 趟2：垂直高斯
+    // Pass 2: vertical Gaussian
     params.dir[0] = 0;
     params.dir[1] = gp.blurSigma / static_cast<float>(regionH_);
     ctx->UpdateSubresource(cb_.Get(), 0, nullptr, &params, 0, 0);
@@ -394,7 +427,15 @@ void GlassRenderer::RunPasses(ID3D11DeviceContext* ctx, GlassPanel& panel, float
     ctx->Draw(3, 0);
     ctx->PSSetShaderResources(0, 1, &nullSrv);
 
-    // 趟3：透镜着色 → 面板背缓冲
+    // Queue the luma staging copy as soon as the blur result is ready: the
+    // submission and execution of the lens pass / Present hide the copy
+    // latency, so the later Map barely waits on the GPU
+    if (lumaWanted_ && SUCCEEDED(EnsureStaging(ctx))) {
+        ctx->CopyResource(stagingTex_.Get(), blurTexB_.Get());
+        stagingValid_ = true;
+    }
+
+    // Pass 3: lens shading → panel back buffer
     ID3D11RenderTargetView* backBuffer = panel.AcquireBackBuffer();
     if (!backBuffer) return;
     params.outSize[0] = panelW;

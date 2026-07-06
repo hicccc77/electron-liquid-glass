@@ -1,156 +1,157 @@
 # Electron-Liquid-Glass
 
-Windows 全局原生低延迟「液态玻璃」背景面板，for Electron。
+English | [简体中文](README.zh-CN.md)
 
-Low-latency native liquid glass backdrop panels for Electron apps, powered by DXGI Desktop Duplication + D3D11 + DirectComposition.
+Low-latency native "liquid glass" backdrop panels for Electron apps on Windows, powered by DXGI Desktop Duplication + D3D11 + DirectComposition.
 
-把液态玻璃渲染为一个全局独立的原生窗口，放在你的 Electron 窗口正下方作为实时背景层。
+The liquid glass effect is rendered as a standalone native window pinned right below your Electron window, acting as a live refractive background layer.
 
-![真实渲染效果：Electron 通知窗口（内容层）+ 原生玻璃面板（折射层）](docs/demo.png)
+![Real render: Electron notification window (content layer) + native glass panel (refraction layer)](https://raw.githubusercontent.com/hicccc77/electron-liquid-glass/main/docs/demo.png)
 
-> 真实渲染截图（非合成图）：通知卡片为 Electron 透明窗口，卡片背后的折射、模糊、色散与驱动文字反色的亮度采样全部来自本模块的原生面板。
+> Real screenshot, not a mockup: the notification card is a transparent Electron window; the refraction, blur, chromatic aberration behind it — and the luminance sampling that drives the adaptive text color — all come from this module's native panel.
 
-## 特性
+## Features
 
-- **真折射，非毛玻璃**：圆角矩形 SDF 透镜位移，边缘可见清晰的背景折射与色散，中心通透
-- **6ms 级响应**：DXGI 零拷贝拿 GPU 桌面纹理，D3D11 渲染，DirectComposition 直接上屏，全程不落 CPU
-- **深度节能**：事件驱动——桌面不动不画、脏区不相交不画、无面板自动休眠
-- **自适应反色支持**：内置亮度带采样（均值色 + luma p15/p85），重绘驱动、与画面同帧推送（上限 ~60Hz），驱动上层文字明暗自适应
-- **z 序锚定**：面板自动钉在指定 Electron 窗口正下方，并周期性重申（防其他置顶窗口插队）
-- **防自采集回环**：`WDA_EXCLUDEFROMCAPTURE` 把面板从一切屏幕捕获中排除
-- **零 Electron 侵入**：纯 N-API 原生模块 + 命令队列，跨 Electron 版本 ABI 稳定，任何 Electron 应用可直接接入
+- **True refraction, not frosted glass**: rounded-rect SDF lens displacement with visible edge refraction and chromatic aberration, crystal-clear center
+- **~6ms response**: zero-copy GPU desktop texture via DXGI, D3D11 shading, DirectComposition presentation — pixels never touch the CPU
+- **Deeply energy-efficient**: fully event-driven and incremental — no repaint when the desktop is static, no repaint when dirty regions don't intersect the panel, the desktop mirror is maintained incrementally from dirty rects (GPU copy volume proportional to actual changed area, not full screen), DWM "echo" dirty rects caused by the panel's own Present are detected and dropped (no self-sustained repaint loop), and the capture session is released when no panel is visible
+- **Adaptive contrast support**: built-in luminance band sampling (mean color + luma p15/p85), repaint-driven and pushed in the same frame as the visual change (capped at ~60Hz), for driving light/dark adaptive text above the glass
+- **Z-order anchoring**: the panel pins itself directly below a given Electron window and periodically re-asserts the order (defends against other topmost windows cutting in)
+- **Self-capture loop prevention**: `WDA_EXCLUDEFROMCAPTURE` excludes the panel from all screen capture
+- **Zero Electron intrusion**: pure N-API native module + command queue, ABI-stable across Electron versions, drops into any Electron app
 
-## 原理
-
-```
-DXGI Desktop Duplication（零拷贝 GPU 桌面纹理，仅画面变化时出帧）
-  → D3D11 三趟着色（半分辨率可分离高斯模糊 ×2 → 圆角 SDF 透镜位移 + RGB 色散 + 饱和度 + 圆角 AA）
-  → DirectComposition 预乘 alpha 交换链直接上屏（不经过 DWM 重定向位图）
-```
-
-- 全链路在一个独立工作线程 + GPU 上完成，无像素跨进程/跨线程拷贝
-- 面板窗口 `WS_EX_NOREDIRECTIONBITMAP + WS_EX_TRANSPARENT + WS_EX_NOACTIVATE`（鼠标穿透、不抢焦点、不进任务栏）
-- JS 侧所有调用经命令队列异步投递到工作线程，天然线程安全
-- 分层协作：本面板负责「玻璃背后的世界」（折射/模糊/色散），你的 Electron 透明窗口负责「玻璃表面」（文字、高光、描边、tint）
+## How it works
 
 ```
-┌─ Electron 透明窗口（内容层：文字 / 高光 / 边框）─┐   ← 你的应用
-│  ┌─ 原生玻璃面板（折射层，钉在正下方）────────┐  │   ← 本模块
-│  │      实时折射的桌面背景                    │  │
-└──┴────────────────────────────────────────────┴──┘
+DXGI Desktop Duplication (zero-copy GPU desktop texture; frames arrive only when the screen changes)
+  → D3D11 three-pass shading (half-res separable Gaussian blur ×2 → rounded-rect SDF lens displacement + RGB dispersion + saturation + rounded-corner AA)
+  → DirectComposition premultiplied-alpha swapchain presentation (bypasses the DWM redirection bitmap)
 ```
 
-## 系统要求
+- The whole chain runs on one dedicated worker thread + the GPU; no pixels cross processes or threads
+- Panel window uses `WS_EX_NOREDIRECTIONBITMAP + WS_EX_TRANSPARENT + WS_EX_NOACTIVATE` (click-through, never steals focus, not in the taskbar)
+- Every JS call is posted asynchronously to the worker thread via a command queue — inherently thread-safe
+- Layered collaboration: this panel renders "the world behind the glass" (refraction/blur/dispersion); your transparent Electron window renders "the glass surface" (text, highlights, borders, tint)
 
-| 平台 | 支持状态 |
+```
+┌─ Electron transparent window (content: text / highlight / border) ─┐   ← your app
+│  ┌─ Native glass panel (refraction layer, pinned right below) ──┐  │   ← this module
+│  │      live refracted desktop background                       │  │
+└──┴──────────────────────────────────────────────────────────────┴──┘
+```
+
+## Requirements
+
+| Platform | Status |
 |---|---|
-| Windows 10 2004 (build 19041)+ |  完整支持 |
-| Windows 更旧版本 | `isSupported()` 返回 `false`（缺少 `WDA_EXCLUDEFROMCAPTURE`） |
-| macOS / Linux | 模块可正常安装加载，`isSupported()` 返回 `false`，请回退到你自己的方案（如 Chromium 桌面流 + WebGL）；macOS 原生后端（ScreenCaptureKit + Metal）在路线图中 |
+| Windows 10 2004 (build 19041)+ | Fully supported |
+| Older Windows | `isSupported()` returns `false` (no `WDA_EXCLUDEFROMCAPTURE`) |
+| macOS / Linux | Installs and loads fine, `isSupported()` returns `false` — fall back to your own approach (e.g. Chromium desktop capture + WebGL); a native macOS backend (ScreenCaptureKit + Metal) is on the roadmap |
 
-构建需要：Node.js 18+、VS Build Tools（C++ 桌面工作负载）+ Python（node-gyp 标准要求）。N-API (NAPI_VERSION 8) 构建，跨 Electron / Node 版本 ABI 稳定，无需按 Electron 头文件重编。
-
-## 安装
+## Install
 
 ```bash
-# 作为 git 依赖
-npm install github:hicccc77/electron-liquid-glass
-
-# 或本地路径（monorepo / 源码调试）
-npm install file:../electron-liquid-glass
+npm install @hicccc77/electron-liquid-glass
 ```
 
-安装时自动 `node-gyp rebuild`。Electron 打包（electron-builder）注意把 `.node` 解包出 asar：
+The npm package ships a prebuilt win32-x64 binary (N-API 8, ABI-stable across Electron / Node versions) — **zero compilation on install, no build toolchain required**. On platforms without a prebuild (macOS/Linux) the module degrades gracefully (`isSupported()` returns `false`) and still never triggers a compile.
+
+When packaging with electron-builder, unpack the `.node` binary from asar:
 
 ```jsonc
-"build": { "asarUnpack": ["**/*.node"] }
+"build": { "asarUnpack": ["node_modules/@hicccc77/electron-liquid-glass/**/*"] }
 ```
 
-## 快速上手（Electron 主进程）
+Building from source (repo checkout, Windows): Node.js 18+, VS Build Tools (C++ desktop workload) + Python. `npm run build` produces `build/Release`; `npm run prebuilds` produces the distributable `prebuilds/win32-x64`.
+
+## Quick start (Electron main process)
 
 ```js
 const { screen } = require('electron')
-const glass = require('electron-liquid-glass')
+const glass = require('@hicccc77/electron-liquid-glass')
 
 if (glass.isSupported()) {
   const dpr = screen.getPrimaryDisplay().scaleFactor
   const panel = glass.createPanel({
-    // 屏幕物理像素
+    // screen physical pixels
     x: 1560, y: 40, width: 344, height: 96,
     cornerRadius: 20, blurSigma: 5,
     displacementScale: 70, aberrationIntensity: 2, saturation: 1.4,
     dpr,
-    anchorWindow: myToastWindow,          // 面板钉在该 BrowserWindow 正下方
-    lumaBands: [                          // 自适应反色的亮度采样带（面板本地物理像素）
+    anchorWindow: myToastWindow,          // pin the panel right below this BrowserWindow
+    lumaBands: [                          // luminance bands for adaptive text contrast (panel-local physical px)
       { id: 0, x: 0, y: 0, width: 344, height: 48 },
       { id: 1, x: 0, y: 48, width: 344, height: 48 }
     ],
     onLuma: bands => {
       // bands = { '0': { r, g, b, darkTail, lightTail }, '1': ... }
-      // 均值 RGB + luma p15/p85（gamma 域 0~255）。重绘驱动：
-      // 背景变化的同一帧推送（上限 ~60Hz），桌面静止时不推送
-      // 据此切换上层文字的明暗配色
+      // Mean RGB + luma p15/p85 (gamma domain, 0-255). Repaint-driven:
+      // pushed in the same frame the background changes (capped ~60Hz),
+      // nothing is pushed while the desktop is static.
+      // Use it to switch your text between light/dark styles.
     }
   })
 
-  panel.show(120)                          // 淡入 120ms
-  panel.setBounds({ x, y, width, height }) // 跟随窗口移动/改尺寸
-  panel.hide(240)                          // 淡出
+  panel.show(120)                          // fade in over 120ms
+  panel.setBounds({ x, y, width, height }) // follow window moves/resizes
+  panel.hide(240)                          // fade out
   panel.destroy()
 } else {
-  // 回退：Chromium 桌面流 + WebGL 折射管线，或静态 backdrop-filter
+  // Fallback: Chromium desktop stream + WebGL refraction pipeline, or a static backdrop-filter
 }
 ```
 
-上层窗口只需把玻璃区域留透明（Electron `transparent: true` 天然满足），自己绘制文字/描边/高光/tint 等内容层，折射背景由本面板提供。
+Your top window only needs to keep the glass area transparent (Electron `transparent: true` already does) and draw the content layer — text, borders, highlights, tint. The refracted background comes from this panel.
 
 ## API
 
-完整类型见 [`index.d.ts`](index.d.ts)。所有面板方法线程安全。
+Full types in [`index.d.ts`](index.d.ts). All panel methods are thread-safe.
 
-| 方法 | 说明 |
+| Method | Description |
 |---|---|
-| `isSupported()` | 当前环境是否可用（Windows 10 2004+ 且原生二进制已构建） |
-| `createPanel(options)` | 创建面板，返回句柄；不可用时返回 `null` |
-| `panel.show(fadeMs?)` / `panel.hide(fadeMs?)` | 淡入 / 淡出（`0` = 立即） |
-| `panel.setBounds(bounds)` | 移动 / 改尺寸（物理像素） |
-| `panel.setParams(params)` | 更新视觉参数（圆角、模糊、位移、色散、饱和度） |
-| `panel.anchor(windowOrHwnd)` | 重新钉到某窗口正下方（接受 `BrowserWindow` 或 HWND Buffer） |
-| `panel.setLumaBands(bands)` / `panel.onLuma(cb)` | 更新亮度采样带 / 回调 |
-| `panel.destroy()` | 销毁面板 |
-| `shutdown()` | 停止工作线程并销毁所有面板 |
+| `isSupported()` | Whether the current environment is supported (Windows 10 2004+ with a native binary available) |
+| `createPanel(options)` | Create a panel, returns a handle; returns `null` when unsupported |
+| `panel.show(fadeMs?)` / `panel.hide(fadeMs?)` | Fade in / out (`0` = immediate) |
+| `panel.setBounds(bounds)` | Move / resize (physical pixels) |
+| `panel.setParams(params)` | Update visual params (corner radius, blur, displacement, aberration, saturation) |
+| `panel.anchor(windowOrHwnd)` | Re-pin below a window (accepts `BrowserWindow` or an HWND Buffer) |
+| `panel.setLumaBands(bands)` / `panel.onLuma(cb)` | Update luminance bands / callback |
+| `panel.destroy()` | Destroy the panel |
+| `shutdown()` | Stop the worker thread and destroy all panels |
 
-## 实测（1080p，动态背景，Windows 11）
+## Measured results (1080p, animated background, Windows 11)
 
-| 指标 | Chromium 流方案（getUserMedia + WebGL） | 本模块 |
+| Metric | Chromium stream approach (getUserMedia + WebGL) | This module |
 |---|---|---|
-| 感知位置滞后（中位 / p90） | 77ms / 89ms | **6ms / 6ms** |
-| 满载 CPU 增量（主+GPU+渲染进程合计） | ~1.5% | **~0.3%** |
-| 静止桌面开销 | 持续采集出帧 | **0**（事件驱动） |
-| 首帧启动 | ~80-300ms（getUserMedia 协商） | **<150ms**（面板常驻复用后为 0） |
-| 40 轮通知压测 | — | 面板 1 建 81 复用，内存零增长，零异常 |
+| Perceived position lag (median / p90) | 77ms / 89ms | **6ms / 6ms** |
+| CPU delta under load (main + GPU + renderer processes) | ~1.5% | **~0.3%** |
+| Static desktop overhead | continuous capture frames | **0 renders / 0 copies** (event-driven) |
+| First-frame startup | ~80-300ms (getUserMedia negotiation) | **<150ms** (0 when a persistent panel is reused) |
+| 40-round notification stress | — | 1 panel created, 81 reuses, zero memory growth, zero errors |
 
-测量方法：同帧差分法——同一帧屏幕采集内对比玻璃呈现内容与背景真值条纹的计数差，两个时间戳均来自绘制时刻，结果与探针自身延迟无关。
+Measurement method: same-frame differencing — within a single captured frame, compare the counter stripes shown through the glass against the ground-truth stripes in the background; both timestamps come from draw time, so probe latency cancels out.
 
-## 源码结构
+
+## Source layout
 
 ```
 src/
-├── addon.cc       N-API 绑定层（参数解析、亮度回调线程安全投递）
-├── session.cc/h   调度中枢：独占工作线程跑「采集→渲染→上屏」闭环、命令队列、节能策略
-├── capture.cc/h   DXGI Desktop Duplication 采集（零拷贝 GPU 纹理 + 脏区）
-├── renderer.cc/h  D3D11 三趟玻璃管线 + 亮度带直方图采样
-├── panel.cc/h     DirectComposition 无重定向位图窗口、淡入淡出、z 序锚定、捕获排除
-├── d3d_utils.cc/h 设备创建辅助
-└── addon_stub.cc  非 Windows 桩（isSupported() = false）
+├── addon.cc       N-API binding layer (argument parsing, thread-safe luma callback dispatch)
+├── session.cc/h   Scheduler: dedicated worker thread running the capture→render→present loop, command queue, energy policies
+├── capture.cc/h   DXGI Desktop Duplication capture (zero-copy GPU texture + dirty regions + self-echo filtering)
+├── renderer.cc/h  D3D11 three-pass glass pipeline + luminance band histogram sampling
+├── panel.cc/h     DirectComposition no-redirection-bitmap window, fades, z-order anchoring, capture exclusion
+├── d3d_utils.cc/h Device creation helper
+├── stats.h        Internal performance counters (`_stats` diagnostic export, used by benchmarks)
+└── addon_stub.cc  Non-Windows stub (isSupported() = false)
 ```
 
-## 已知限制
+## Known limitations
 
-- 目前仅 Windows 有原生实现（macOS ScreenCaptureKit + Metal 后端在路线图中，API 已按平台后端可插拔设计）
-- 面板排除于截屏/录屏（`WDA_EXCLUDEFROMCAPTURE` 的语义，与内容保护窗口一致）
-- 安全桌面（UAC / 锁屏）期间采集暂停，返回后自动恢复
-- 多显示器：采集会话跟随首个可见面板所在显示器；跨屏移动面板会自动重建会话
+- Native implementation is Windows-only for now (macOS ScreenCaptureKit + Metal backend is on the roadmap; the API is designed for pluggable per-platform backends)
+- The panel is excluded from screenshots/recordings (the semantics of `WDA_EXCLUDEFROMCAPTURE`, same as content-protected windows)
+- Capture pauses during secure desktop (UAC / lock screen) and resumes automatically afterwards
+- Multi-monitor: the capture session follows the display of the first visible panel; moving a panel across displays rebuilds the session automatically
 
 ## License
 

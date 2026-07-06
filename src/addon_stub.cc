@@ -1,5 +1,6 @@
-// 非 Windows 平台占位实现：模块可加载，isSupported 恒为 false，
-// 调用方据此回退到自己的跨平台方案（如 Chromium 屏幕采集管线）
+// Placeholder implementation for non-Windows platforms: the module loads,
+// isSupported is always false, and callers fall back to their own
+// cross-platform approach (e.g. a Chromium screen-capture pipeline)
 #include <napi.h>
 
 namespace {

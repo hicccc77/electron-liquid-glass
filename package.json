@@ -1,6 +1,6 @@
 {
-  "name": "electron-liquid-glass",
-  "version": "0.1.0",
+  "name": "@hicccc77/electron-liquid-glass",
+  "version": "0.2.1",
   "description": "Low-latency native liquid glass backdrop panels for Electron apps (Windows: DXGI Desktop Duplication + D3D11 + DirectComposition)",
   "main": "index.js",
   "types": "index.d.ts",
@@ -26,24 +26,29 @@
     "d3d11",
     "windows"
   ],
-  "os": [
-    "win32",
-    "darwin",
-    "linux"
-  ],
   "scripts": {
-    "build": "node-gyp rebuild"
+    "install": "node scripts/install-guard.cjs",
+    "build": "node-gyp rebuild",
+    "prebuilds": "prebuildify --napi --strip",
+    "prepublishOnly": "node scripts/check-prebuilds.cjs"
   },
-  "gypfile": true,
   "dependencies": {
-    "node-addon-api": "^8.5.0"
+    "node-addon-api": "^8.5.0",
+    "node-gyp-build": "^4.8.4"
+  },
+  "devDependencies": {
+    "prebuildify": "^6.0.1"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "index.js",
     "index.d.ts",
-    "binding.gyp",
-    "src/",
+    "prebuilds/",
+    "scripts/install-guard.cjs",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE"
   ]
 }
