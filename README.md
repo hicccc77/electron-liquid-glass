@@ -8,7 +8,7 @@ Low-latency native liquid glass backdrop panels for Electron apps, powered by DX
 
 ![真实渲染效果：Electron 通知窗口（内容层）+ 原生玻璃面板（折射层）](docs/demo.png)
 
-> 真实渲染截图（非合成图）：通知卡片为 Electron 透明窗口，卡片背后的折射、模糊、色散与驱动文字反色的亮度采样全部来自本模块的原生面板。注意玻璃上缘被折弯的色块、左缘弯曲的待办文字与下缘扭曲的大字。
+> 真实渲染截图（非合成图）：通知卡片为 Electron 透明窗口，卡片背后的折射、模糊、色散与驱动文字反色的亮度采样全部来自本模块的原生面板。
 
 ## 特性
 
