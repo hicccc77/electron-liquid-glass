@@ -65,17 +65,19 @@ float4 PSLens(float4 pos : SV_Position) : SV_Target {
   float coverage = saturate(0.5 - sd);
   if (coverage <= 0.0) return float4(0, 0, 0, 0);
 
-  // Convex lens rim (outward refraction): the glass edge compresses content
-  // from beyond the boundary into the rim band — optically consistent with
-  // iOS liquid glass / the rim of a glass sphere. Profile (1-t)²: looks
-  // furthest outward at the boundary (maxBend) and decays smoothly to 0 with
-  // depth (C¹ blend into the flat center). Mapping slope
-  // = 1 + 2·maxBend/bezel·(1-t) ≥ 1: compression everywhere, so stretching /
-  // ghosting is structurally impossible
+  // Liquid meniscus rim (iOS edge treatment): the band redistributes its OWN
+  // content — swell (stretch) near the boundary, catch-up compression toward
+  // the center. Sampling map s(d) = -d + bump(t)·bend is continuous at BOTH
+  // ends (bump(0)=bump(1)=0): content connects seamlessly across the glass
+  // edge (no cut line) and into the clear center. Injectivity: the rise slope
+  // is capped via maxBend ≤ 0.7/1.5·tp·bezel, so |stretch| ≤ ~3.3× and the
+  // mirrored "tongue" fold is structurally impossible; the fall side only
+  // compresses (slope < -1), which is always injective.
   float depth = -sd;
   float2 disp = float2(0, 0);
   float2 nrm = float2(0, 0);
-  float humpV = 0.0;
+  float bump = 0.0;
+  float edgeW = 0.0;
   if (depth > 0.0 && depth < bezel) {
     float2 q = abs(p) - halfSize + r;
     // Normal direction blends smoothly through corners (softness on the order
@@ -83,8 +85,11 @@ float4 PSLens(float4 pos : SV_Position) : SV_Target {
     float2 qs = softClamp(q, max(r * 0.8, 1.0));
     nrm = (qs / max(length(qs), 1e-4)) * sign(p + float2(1e-6, 1e-6));
     float t = depth / bezel;
-    humpV = (1.0 - t) * (1.0 - t);
-    disp = nrm * (humpV * maxBend) * dispFactor;
+    edgeW = (1.0 - t) * (1.0 - t);
+    // C¹ bump: smoothstep rise to the peak at t = 0.62, smoothstep fall to 0
+    float u = saturate(t < 0.62 ? t / 0.62 : (1.0 - t) / 0.38);
+    bump = u * u * (3.0 - 2.0 * u);
+    disp = nrm * (bump * maxBend * min(dispFactor, 1.0));
   }
 
   // 5-tap footprint integration inside the compression band (radial spread +
@@ -96,7 +101,7 @@ float4 PSLens(float4 pos : SV_Position) : SV_Target {
   float dispLen2 = dot(disp, disp);
   if (dispLen2 > 0.25) {
     float2 tangent = float2(nrm.y, -nrm.x) * sqrt(dispLen2);
-    float rs = 0.05 + 0.10 * humpV;
+    float rs = 0.05 + 0.10 * bump;
     float radial[5] = { 1.0 - 2.0 * rs, 1.0 - rs, 1.0, 1.0 + rs, 1.0 + 2.0 * rs };
     const float lateral[5] = { -0.36, 0.18, 0.0, -0.18, 0.36 };
     const float wts[5] = { 0.14, 0.22, 0.28, 0.22, 0.14 };
@@ -113,6 +118,14 @@ float4 PSLens(float4 pos : SV_Position) : SV_Target {
   }
   float lum = dot(c, float3(0.213, 0.715, 0.072));
   c = lerp(lum.xxx, c, saturation);
+
+  // Broad rim lighting hugging the boundary (light from top-left): a soft
+  // specular lift on the light-facing rim and a faint shade opposite — the
+  // "physical thickness" cue of iOS glass. Weighted by edgeW (max at the
+  // boundary, C¹ fade inward) independently of the displacement bump. Thin
+  // sharp border rings stay the content layer's job.
+  float lightDot = dot(nrm, float2(-0.40, -0.92));
+  c = saturate(c + edgeW * (0.09 * saturate(lightDot) - 0.04 * saturate(-lightDot)));
 
   float a = coverage * alpha;
   return float4(c * a, a);
@@ -369,13 +382,16 @@ void GlassRenderer::RunPasses(ID3D11DeviceContext* ctx, GlassPanel& panel, float
     const float margin = kBlurMarginCss * dpr;
 
     // Lens geometry matching the WebGL implementation (physical pixels).
-    // maxBend = how far past the boundary the rim looks outward (outward
-    // refraction has no monotonicity constraint, so it can be strong); capped
-    // by the blur texture margin (kBlurMarginCss) to avoid clamped sampling
-    // beyond the region.
+    // iOS-style wide wet rim: the band takes up to 75% of the half-min
+    // dimension (small pills are almost all lens, larger surfaces keep a clear
+    // center). maxBend = peak of the meniscus bump, slope-limited so the
+    // sampling map stays injective: rise slope = 1.5/tp·maxBend/bezel ≤ 0.7
+    // (max ~3.3× local stretch, tp = 0.62) ⇒ maxBend = 0.7/1.5·0.62·bezel.
+    // Well inside the blur margin (≈0.29·bezel ≪ kBlurMarginCss·dpr), so
+    // footprint taps never sample outside the region.
     const float halfMin = std::min(panelW, panelH) / 2.0f;
-    const float bezel = std::min(24.0f * dpr, halfMin * 0.55f);
-    const float maxBend = std::min({ 16.0f * dpr, bezel * 0.6f, margin * 0.8f });
+    const float bezel = std::min(34.0f * dpr, halfMin * 0.75f);
+    const float maxBend = 0.289f * bezel;
 
     ShaderParams params{};
     params.glassSize[0] = panelW;

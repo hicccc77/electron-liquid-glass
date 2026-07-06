@@ -1,6 +1,6 @@
 {
   "name": "@hicccc77/electron-liquid-glass",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Low-latency native liquid glass backdrop panels for Electron apps (Windows: DXGI Desktop Duplication + D3D11 + DirectComposition)",
   "main": "index.js",
   "types": "index.d.ts",
