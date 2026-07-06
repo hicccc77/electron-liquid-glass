@@ -1,0 +1,49 @@
+{
+  "name": "electron-liquid-glass",
+  "version": "0.1.0",
+  "description": "Low-latency native liquid glass backdrop panels for Electron apps (Windows: DXGI Desktop Duplication + D3D11 + DirectComposition)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "author": "hicccc77",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hicccc77/electron-liquid-glass.git"
+  },
+  "homepage": "https://github.com/hicccc77/electron-liquid-glass#readme",
+  "bugs": {
+    "url": "https://github.com/hicccc77/electron-liquid-glass/issues"
+  },
+  "keywords": [
+    "electron",
+    "liquid-glass",
+    "glassmorphism",
+    "backdrop",
+    "blur",
+    "native",
+    "directcomposition",
+    "desktop-duplication",
+    "d3d11",
+    "windows"
+  ],
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
+  "scripts": {
+    "build": "node-gyp rebuild"
+  },
+  "gypfile": true,
+  "dependencies": {
+    "node-addon-api": "^8.5.0"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "binding.gyp",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ]
+}
